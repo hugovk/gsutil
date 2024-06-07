@@ -44,6 +44,12 @@ try:
 except ImportError:
   HAS_OPENSSL = False
 
+try:
+  import cryptography
+  HAS_CRYPTO = True
+except ImportError:
+  HAS_CRYPTO = False
+
 ERROR_MESSAGE = "This is the error message"
 
 
@@ -52,6 +58,7 @@ def getBotoCredentialsConfig(
     user_account_creds=None,
     gce_creds=None,
     external_account_creds=None,
+    external_account_authorized_user_creds=None,
 ):
   config = []
   if service_account_creds:
@@ -61,19 +68,22 @@ def getBotoCredentialsConfig(
                    service_account_creds["client_id"]))
   else:
     config.append(("Credentials", "gs_service_key_file", None))
-  config.extend([
-      ("Credentials", "gs_oauth2_refresh_token", user_account_creds),
-      ("GoogleCompute", "service_account", gce_creds),
-      ("Credentials", "gs_external_account_file", external_account_creds),
-  ])
+  config.extend([("Credentials", "gs_oauth2_refresh_token", user_account_creds),
+                 ("GoogleCompute", "service_account", gce_creds),
+                 ("Credentials", "gs_external_account_file",
+                  external_account_creds),
+                 ("Credentials", "gs_external_account_authorized_user_file",
+                  external_account_authorized_user_creds)])
   return config
 
 
 class TestGcsJsonCredentials(testcase.GsUtilUnitTestCase):
   """Test logic for interacting with GCS JSON Credentials."""
 
-  @unittest.skipUnless(HAS_OPENSSL, 'signurl requires pyopenssl.')
-  def testOauth2ServiceAccountCredential(self):
+  @mock.patch.object(gcs_json_credentials.P12Credentials,
+                     "from_service_account_pkcs12_keystring",
+                     return_value=gcs_json_credentials.P12Credentials(mock.Mock(), token_uri='123', service_account_email='123', scopes=['a', 'b']))
+  def testOauth2ServiceAccountCredential(self, _):
     contents = pkgutil.get_data("gslib", "tests/test_data/test.p12")
     tmpfile = self.CreateTempFile(contents=contents)
     with SetBotoConfigForTest(
@@ -83,10 +93,17 @@ class TestGcsJsonCredentials(testcase.GsUtilUnitTestCase):
         })):
       self.assertTrue(gcs_json_credentials._HasOauth2ServiceAccountCreds())
       client = gcs_json_api.GcsJsonApi(None, None, None, None)
-      self.assertIsInstance(client.credentials, ServiceAccountCredentials)
+      self.assertEqual(client.credentials.service_account_email, '123')
+      self.assertIsInstance(client.credentials, gcs_json_credentials.P12Credentials)
 
-  @unittest.skipUnless(HAS_OPENSSL, 'signurl requires pyopenssl.')
-  @mock.patch.object(ServiceAccountCredentials,
+  def testP12CredentialsthrowsErrorIfProvidedWithMissingFields(self):
+    contents = pkgutil.get_data("gslib", "tests/test_data/test.p12")
+    tmpfile = self.CreateTempFile(contents=contents)
+    with self.assertRaises(Exception) as exc:
+      gcs_json_credentials.CreateP12ServiceAccount(tmpfile)
+
+  @unittest.skipUnless(HAS_CRYPTO, 'p12credentials requires cryptography.')
+  @mock.patch.object(gcs_json_credentials.P12Credentials,
                      "__init__",
                      side_effect=ValueError(ERROR_MESSAGE))
   def testOauth2ServiceAccountFailure(self, _):
@@ -136,7 +153,7 @@ class TestGcsJsonCredentials(testcase.GsUtilUnitTestCase):
       self.assertTrue(gcs_json_credentials._HasGceCreds())
       client = gcs_json_api.GcsJsonApi(None, None, None, None)
       self.assertIsInstance(client.credentials, GceAssertionCredentials)
-      self.assertEquals(client.credentials.refresh_token, "rEfrEshtOkEn")
+      self.assertEqual(client.credentials.refresh_token, "rEfrEshtOkEn")
       self.assertIs(client.credentials.client_id, None)
 
   @mock.patch.object(GceAssertionCredentials,
@@ -173,6 +190,37 @@ class TestGcsJsonCredentials(testcase.GsUtilUnitTestCase):
           gcs_json_api.GcsJsonApi(None, logging.getLogger(), None, None)
         self.assertIn(ERROR_MESSAGE, str(exc.exception))
         self.assertIn(CredTypes.EXTERNAL_ACCOUNT, logger.output[0])
+
+  def testExternalAccountAuthorizedUserCredential(self):
+    contents = pkgutil.get_data(
+        "gslib",
+        "tests/test_data/test_external_account_authorized_user_credentials.json"
+    )
+    tmpfile = self.CreateTempFile(contents=contents)
+    with SetBotoConfigForTest(
+        getBotoCredentialsConfig(
+            external_account_authorized_user_creds=tmpfile)):
+      client = gcs_json_api.GcsJsonApi(None, None, None, None)
+      self.assertIsInstance(client.credentials, WrappedCredentials)
+
+  @mock.patch.object(WrappedCredentials,
+                     "__init__",
+                     side_effect=ValueError(ERROR_MESSAGE))
+  def testExternalAccountAuthorizedUserFailure(self, _):
+    contents = pkgutil.get_data(
+        "gslib",
+        "tests/test_data/test_external_account_authorized_user_credentials.json"
+    )
+    tmpfile = self.CreateTempFile(contents=contents)
+    with SetBotoConfigForTest(
+        getBotoCredentialsConfig(
+            external_account_authorized_user_creds=tmpfile)):
+      with self.assertLogs() as logger:
+        with self.assertRaises(Exception) as exc:
+          gcs_json_api.GcsJsonApi(None, logging.getLogger(), None, None)
+        self.assertIn(ERROR_MESSAGE, str(exc.exception))
+        self.assertIn(CredTypes.EXTERNAL_ACCOUNT_AUTHORIZED_USER,
+                      logger.output[0])
 
   def testOauth2ServiceAccountAndOauth2UserCredential(self):
     with SetBotoConfigForTest(

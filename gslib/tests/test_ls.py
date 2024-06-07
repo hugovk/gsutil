@@ -34,6 +34,7 @@ from gslib.cs_api_map import ApiSelector
 from gslib.project_id import PopulateProjectId
 import gslib.tests.testcase as testcase
 from gslib.tests.testcase.integration_testcase import SkipForGS
+from gslib.tests.testcase.integration_testcase import SkipForJSON
 from gslib.tests.testcase.integration_testcase import SkipForS3
 from gslib.tests.testcase.integration_testcase import SkipForXML
 from gslib.tests.util import CaptureStdout
@@ -41,6 +42,7 @@ from gslib.tests.util import ObjectToURI as suri
 from gslib.tests.util import RUN_S3_TESTS
 from gslib.tests.util import SetBotoConfigForTest
 from gslib.tests.util import SetEnvironmentForTest
+from gslib.tests.util import SkipForP12Creds
 from gslib.tests.util import TEST_ENCRYPTION_CONTENT1
 from gslib.tests.util import TEST_ENCRYPTION_CONTENT1_CRC32C
 from gslib.tests.util import TEST_ENCRYPTION_CONTENT1_MD5
@@ -70,6 +72,7 @@ from gslib.utils.constants import UTF8
 from gslib.utils.ls_helper import PrintFullInfoAboutObject
 from gslib.utils.retry_util import Retry
 from gslib.utils.system_util import IS_WINDOWS
+from gslib.utils import shim_util
 
 from six import add_move, MovedModule
 
@@ -190,6 +193,10 @@ class TestLsUnit(testcase.GsUtilUnitTestCase):
                                return_stdout=True)
     self.assertNotRegex(stdout, 'Placement locations:')
 
+
+class TestLsUnitWithShim(testcase.ShimUnitTestBase):
+  """Unit tests for ls command with shim."""
+
   def test_shim_translates_flags(self):
     with SetBotoConfigForTest([('GSUtil', 'use_gcloud_storage', 'True'),
                                ('GSUtil', 'hidden_shim_mode', 'dry_run')]):
@@ -200,9 +207,10 @@ class TestLsUnit(testcase.GsUtilUnitTestCase):
         mock_log_handler = self.RunCommand('ls', ['-rRlLbeah', '-p foo'],
                                            return_log_handler=True)
         self.assertIn(
-            'Gcloud Storage Command: {} alpha storage ls'
+            'Gcloud Storage Command: {} storage ls'
+            ' --fetch-encrypted-object-hashes'
             ' -r -r -l -L -b -e -a --readable-sizes --project  foo'.format(
-                os.path.join('fake_dir', 'bin', 'gcloud')),
+                shim_util._get_gcloud_binary_path('fake_dir')),
             mock_log_handler.messages['info'])
 
 
@@ -395,7 +403,31 @@ class TestLs(testcase.GsUtilIntegrationTestCase):
   def test_301_location_redirect(self):
     self.location_redirect_test_helper('eu-west-1', 'us-east-2')
 
+  @SkipForS3('Not relevant for S3')
+  @SkipForJSON('Only the XML API supports changing the calling format.')
+  def test_default_gcs_calling_format_is_path_style(self):
+    bucket_uri = self.CreateBucket()
+    object_uri = self.CreateObject(bucket_uri=bucket_uri, contents=b'foo')
+
+    stderr = self.RunGsUtil(['-D', 'ls', suri(object_uri)], return_stdout=True)
+    self.assertIn('Host: storage.googleapis.com', stderr)
+
+  @SkipForS3('Not relevant for S3')
+  @SkipForJSON('Only the XML API supports changing the calling format.')
+  def test_gcs_calling_format_is_configurable(self):
+    bucket_uri = self.CreateBucket()
+    object_uri = self.CreateObject(bucket_uri=bucket_uri, contents=b'foo')
+
+    custom_calling_format = 'boto.s3.connection.SubdomainCallingFormat'
+    with SetBotoConfigForTest([('s3', 'calling_format', custom_calling_format)
+                              ]):
+      stderr = self.RunGsUtil(['-D', 'ls', suri(object_uri)],
+                              return_stdout=True)
+    self.assertIn('Host: %s.storage.googleapis.com' % bucket_uri.bucket_name,
+                  stderr)
+
   @SkipForXML('Credstore file gets created only for json API')
+  @SkipForP12Creds('P12 credentials are not cached, as they are supported via google-auth')
   def test_credfile_lock_permissions(self):
     tmpdir = self.CreateTempDir()
     filepath = os.path.join(tmpdir, 'credstore2')
@@ -647,19 +679,20 @@ class TestLs(testcase.GsUtilIntegrationTestCase):
     stdout = self.RunGsUtil(['ls', '-lb', bucket_suri], return_stdout=True)
     self.assertNotIn('Logging configuration', stdout)
 
+    spacing = '       ' if self._use_gcloud_storage else '\t\t'
     # Logging configuration is absent by default
     stdout = self.RunGsUtil(['ls', '-Lb', bucket_suri], return_stdout=True)
-    self.assertIn('Logging configuration:\t\tNone', stdout)
+    self.assertIn('Logging configuration:{}None'.format(spacing), stdout)
 
     # Enable and check
     self.RunGsUtil(['logging', 'set', 'on', '-b', bucket_suri, bucket_suri])
     stdout = self.RunGsUtil(['ls', '-Lb', bucket_suri], return_stdout=True)
-    self.assertIn('Logging configuration:\t\tPresent', stdout)
+    self.assertIn('Logging configuration:{}Present'.format(spacing), stdout)
 
     # Disable and check
     self.RunGsUtil(['logging', 'set', 'off', bucket_suri])
     stdout = self.RunGsUtil(['ls', '-Lb', bucket_suri], return_stdout=True)
-    self.assertIn('Logging configuration:\t\tNone', stdout)
+    self.assertIn('Logging configuration:{}None'.format(spacing), stdout)
 
   @SkipForS3('S3 bucket configuration values are not supported via ls.')
   def test_web(self):
@@ -671,19 +704,20 @@ class TestLs(testcase.GsUtilIntegrationTestCase):
     stdout = self.RunGsUtil(['ls', '-lb', bucket_suri], return_stdout=True)
     self.assertNotIn('Website configuration', stdout)
 
+    spacing = '       ' if self._use_gcloud_storage else '\t\t'
     # Website configuration is absent by default
     stdout = self.RunGsUtil(['ls', '-Lb', bucket_suri], return_stdout=True)
-    self.assertIn('Website configuration:\t\tNone', stdout)
+    self.assertIn('Website configuration:{}None'.format(spacing), stdout)
 
     # Initialize and check
     self.RunGsUtil(['web', 'set', '-m', 'google.com', bucket_suri])
     stdout = self.RunGsUtil(['ls', '-Lb', bucket_suri], return_stdout=True)
-    self.assertIn('Website configuration:\t\tPresent', stdout)
+    self.assertIn('Website configuration:{}Present'.format(spacing), stdout)
 
     # Clear and check
     self.RunGsUtil(['web', 'set', bucket_suri])
     stdout = self.RunGsUtil(['ls', '-Lb', bucket_suri], return_stdout=True)
-    self.assertIn('Website configuration:\t\tNone', stdout)
+    self.assertIn('Website configuration:{}None'.format(spacing), stdout)
 
   @SkipForS3('S3 bucket configuration values are not supported via ls.')
   @SkipForXML('Requester Pays is not supported for the XML API.')
@@ -692,23 +726,24 @@ class TestLs(testcase.GsUtilIntegrationTestCase):
     bucket_uri = self.CreateBucket()
     bucket_suri = suri(bucket_uri)
 
+    spacing = '      ' if self._use_gcloud_storage else '\t\t'
     # No requester pays configuration
     stdout = self.RunGsUtil(['ls', '-lb', bucket_suri], return_stdout=True)
     self.assertNotIn('Requester Pays enabled', stdout)
 
     # Requester Pays configuration is absent by default
     stdout = self.RunGsUtil(['ls', '-Lb', bucket_suri], return_stdout=True)
-    self.assertIn('Requester Pays enabled:\t\tNone', stdout)
+    self.assertIn('Requester Pays enabled:{}None'.format(spacing), stdout)
 
     # Initialize and check
     self.RunGsUtil(['requesterpays', 'set', 'on', bucket_suri])
     stdout = self.RunGsUtil(['ls', '-Lb', bucket_suri], return_stdout=True)
-    self.assertIn('Requester Pays enabled:\t\tTrue', stdout)
+    self.assertIn('Requester Pays enabled:{}True'.format(spacing), stdout)
 
     # Clear and check
     self.RunGsUtil(['requesterpays', 'set', 'off', bucket_suri])
     stdout = self.RunGsUtil(['ls', '-Lb', bucket_suri], return_stdout=True)
-    self.assertIn('Requester Pays enabled:\t\tFalse', stdout)
+    self.assertIn('Requester Pays enabled:{}False'.format(spacing), stdout)
 
   def test_list_sizes(self):
     """Tests various size listing options."""
@@ -892,9 +927,13 @@ class TestLs(testcase.GsUtilIntegrationTestCase):
     stderr = self.RunGsUtil(['ls', suri(bucket_uri, 'wildcard*')],
                             return_stderr=True,
                             expected_status=1)
-    self.assertIn(
-        'Cloud folder %s%s contains a wildcard' %
-        (suri(bucket_uri), '/wildcard*/'), stderr)
+
+    if self._use_gcloud_storage:
+      warning_message = ('Cloud folders named with wildcards are not supported.'
+                         ' API returned {}/wildcard*/')
+    else:
+      warning_message = 'Cloud folder {}/wildcard*/ contains a wildcard'
+    self.assertIn(warning_message.format(suri(bucket_uri)), stderr)
 
     # Listing with a flat wildcard should still succeed.
     # Use @Retry as hedge against bucket listing eventual consistency.
@@ -1075,7 +1114,7 @@ class TestLs(testcase.GsUtilIntegrationTestCase):
     bucket_uri = self.CreateBucketWithRetentionPolicy(
         retention_period_in_seconds=1)
     stdout = self.RunGsUtil(['ls', '-Lb', suri(bucket_uri)], return_stdout=True)
-    self.assertRegex(stdout, r'Retention Policy\:\t*Present')
+    self.assertRegex(stdout, r'Retention Policy\:\s*Present')
     # Clearing Retention Policy on the bucket.
     self.RunGsUtil(['retention', 'clear', suri(bucket_uri)])
     stdout = self.RunGsUtil(['ls', '-Lb', suri(bucket_uri)], return_stdout=True)
@@ -1123,11 +1162,11 @@ class TestLs(testcase.GsUtilIntegrationTestCase):
     bucket_uri = self.CreateBucket()
     stdout = self.RunGsUtil(['ls', '-Lb', suri(bucket_uri)], return_stdout=True)
     self.assertRegex(stdout,
-                     r'Public access prevention:\t*(unspecified|inherited)')
+                     r'Public access prevention:\s*(unspecified|inherited)')
     # Enforce public access prevention.
     self.RunGsUtil(['pap', 'set', 'enforced', suri(bucket_uri)])
     stdout = self.RunGsUtil(['ls', '-Lb', suri(bucket_uri)], return_stdout=True)
-    self.assertRegex(stdout, r'Public access prevention:\t*enforced')
+    self.assertRegex(stdout, r'Public access prevention:\s*enforced')
 
   @SkipForXML('RPO is not supported for the XML API.')
   @SkipForS3('RPO is not supported for S3 buckets.')
@@ -1143,13 +1182,15 @@ class TestLs(testcase.GsUtilIntegrationTestCase):
     stdout = self.RunGsUtil(['ls', '-Lb', suri(bucket_uri)], return_stdout=True)
     self.assertRegex(stdout, r'RPO:\t\t\t\tASYNC_TURBO')
 
+  @SkipForXML('Custom Dual Region is not supported for the XML API.')
   @SkipForS3('Custom Dual Region is not supported for S3 buckets.')
-  def test_list_Lb_displays_custom_dual_region_info(self):
+  def test_list_Lb_displays_custom_dual_region_placement_info(self):
     bucket_name = 'gs://' + self.MakeTempName('bucket')
-    self.RunGsUtil(['mb', '-l', 'us-central1+us-west1', bucket_name],
+    self.RunGsUtil(['mb', '--placement', 'us-central1,us-west1', bucket_name],
                    expected_status=0)
     stdout = self.RunGsUtil(['ls', '-Lb', bucket_name], return_stdout=True)
-    self.assertRegex(stdout, r"Location constraint:\t\tUS-CENTRAL1\+US-WEST1")
+    self.assertRegex(stdout,
+                     r"Placement locations:\t\t\['US-CENTRAL1', 'US-WEST1'\]")
 
   @SkipForXML('Autoclass is not supported for the XML API.')
   @SkipForS3('Autoclass is not supported for S3 buckets.')

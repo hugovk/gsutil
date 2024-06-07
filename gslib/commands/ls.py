@@ -76,10 +76,10 @@ ordered in the list lexicographically by name.
 
   gsutil currently supports ``gs://`` and ``s3://`` as valid providers
 
-  If you specify bucket URLs, or use `Wildcards
-  <https://cloud.google.com/storage/docs/gsutil/addlhelp/WildcardNames>`_ to
-  capture a set of buckets, ``gsutil ls`` lists objects at the top level of each
-  bucket, along with the names of each subdirectory. For example:
+  If you specify bucket URLs, or use `URI wildcards
+  <https://cloud.google.com/storage/docs/wildcards>`_ to capture a set of
+  buckets, ``gsutil ls`` lists objects at the top level of each bucket, along
+  with the names of each subdirectory. For example:
 
     gsutil ls gs://bucket
 
@@ -103,7 +103,8 @@ ordered in the list lexicographically by name.
   lists all files whose name matches the above wildcard at the top level of
   the bucket.
 
-  See "gsutil help wildcards" for more details on working with wildcards.
+  For more details, see `URI wildcards
+  <https://cloud.google.com/storage/docs/wildcards>`_.
 
 
 <B>DIRECTORY BY DIRECTORY, FLAT, and RECURSIVE LISTINGS</B>
@@ -332,7 +333,7 @@ class LsCommand(Command):
 
   # TODO(b/206151616) Add mappings for remaining flags.
   gcloud_storage_map = GcloudStorageMap(
-      gcloud_command=['alpha', 'storage', 'ls'],
+      gcloud_command=['storage', 'ls', '--fetch-encrypted-object-hashes'],
       flag_map={
           '-r': GcloudStorageFlag('-r'),
           '-R': GcloudStorageFlag('-r'),
@@ -396,6 +397,9 @@ class LsCommand(Command):
           bucket.autoclass.toggleTime.strftime('%a, %d %b %Y'))
     if bucket.locationType:
       fields['location_type'] = bucket.locationType
+    if bucket.customPlacementConfig:
+      fields['custom_placement_locations'] = (
+          bucket.customPlacementConfig.dataLocations)
     if bucket.metageneration:
       fields['metageneration'] = bucket.metageneration
     if bucket.timeCreated:
@@ -434,6 +438,7 @@ class LsCommand(Command):
     # returns many fields that the XML API does not).
     autoclass_line = ''
     location_type_line = ''
+    custom_placement_locations_line = ''
     metageneration_line = ''
     time_created_line = ''
     time_updated_line = ''
@@ -447,6 +452,9 @@ class LsCommand(Command):
       autoclass_line = '\tAutoclass:\t\t\tEnabled on {autoclass_enabled_date}\n'
     if 'location_type' in fields:
       location_type_line = '\tLocation type:\t\t\t{location_type}\n'
+    if 'custom_placement_locations' in fields:
+      custom_placement_locations_line = (
+          '\tPlacement locations:\t\t{custom_placement_locations}\n')
     if 'metageneration' in fields:
       metageneration_line = '\tMetageneration:\t\t\t{metageneration}\n'
     if 'time_created' in fields:
@@ -473,6 +481,7 @@ class LsCommand(Command):
         ('{bucket} :\n'
          '\tStorage class:\t\t\t{storage_class}\n' + location_type_line +
          '\tLocation constraint:\t\t{location_constraint}\n' +
+         custom_placement_locations_line +
          '\tVersioning enabled:\t\t{versioning}\n'
          '\tLogging configuration:\t\t{logging_config}\n'
          '\tWebsite configuration:\t\t{website_config}\n'
@@ -592,6 +601,7 @@ class LsCommand(Command):
             'autoclass',
             'billing',
             'cors',
+            'customPlacementConfig',
             'defaultObjectAcl',
             'encryption',
             'iamConfiguration',

@@ -32,6 +32,7 @@ import mimetypes
 from operator import attrgetter
 import os
 import pickle
+import pyu2f
 import random
 import re
 import shutil
@@ -237,7 +238,7 @@ UPLOAD_RETURN_FIELDS = [
 PerformParallelUploadFileToObjectArgs = namedtuple(
     'PerformParallelUploadFileToObjectArgs',
     'filename file_start file_length src_url dst_url canned_acl '
-    'content_type tracker_file tracker_file_lock encryption_key_sha256 '
+    'content_type storage_class tracker_file tracker_file_lock encryption_key_sha256 '
     'gzip_encoded')
 
 PerformSlicedDownloadObjectToFileArgs = namedtuple(
@@ -331,11 +332,12 @@ def _PerformParallelUploadFileToObject(cls, args, thread_state=None):
     # reach a state in which uploads will always fail on retries.
     preconditions = None
 
-    # Fill in content type if one was provided.
+    # Fill in content type and storage class if one was provided.
     dst_object_metadata = apitools_messages.Object(
         name=args.dst_url.object_name,
         bucket=args.dst_url.bucket_name,
-        contentType=args.content_type)
+        contentType=args.content_type,
+        storageClass=args.storage_class)
 
     orig_prefer_api = gsutil_api.prefer_api
     try:
@@ -997,13 +999,14 @@ def CheckForDirFileConflict(exp_src_url, dst_url):
                            (exp_src_url.url_string, dst_path))
 
 
-def _PartitionFile(fp,
-                   file_size,
-                   src_url,
+def _PartitionFile(canned_acl,
                    content_type,
-                   canned_acl,
                    dst_bucket_url,
+                   file_size,
+                   fp,
                    random_prefix,
+                   src_url,
+                   storage_class,
                    tracker_file,
                    tracker_file_lock,
                    encryption_key_sha256=None,
@@ -1016,14 +1019,15 @@ def _PartitionFile(fp,
   corresponding to each part.
 
   Args:
-    fp: The file object to be partitioned.
-    file_size: The size of fp, in bytes.
-    src_url: Source FileUrl from the original command.
-    content_type: content type for the component and final objects.
     canned_acl: The user-provided canned_acl, if applicable.
-    dst_bucket_url: CloudUrl for the destination bucket
+    content_type: content type for the component and final objects.
+    dst_bucket_url: CloudUrl for the destination bucket.
+    file_size: The size of fp, in bytes.
+    fp: The file object to be partitioned.
     random_prefix: The randomly-generated prefix used to prevent collisions
                    among the temporary component names.
+    src_url: Source FileUrl from the original command.
+    storage_class: storage class for the component and final objects.
     tracker_file: The path to the parallel composite upload tracker file.
     tracker_file_lock: The lock protecting access to the tracker file.
     encryption_key_sha256: Encryption key SHA256 for use in this upload, if any.
@@ -1064,8 +1068,8 @@ def _PartitionFile(fp,
     offset = i * component_size
     func_args = PerformParallelUploadFileToObjectArgs(
         fp.name, offset, file_part_length, src_url, tmp_dst_url, canned_acl,
-        content_type, tracker_file, tracker_file_lock, encryption_key_sha256,
-        gzip_encoded)
+        content_type, storage_class, tracker_file, tracker_file_lock,
+        encryption_key_sha256, gzip_encoded)
     file_names.append(temp_file_name)
     dst_args[temp_file_name] = func_args
 
@@ -1164,13 +1168,14 @@ def _DoParallelCompositeUpload(fp,
   # before and after the operation.
   components_info = {}
   # Get the set of all components that should be uploaded.
-  dst_args = _PartitionFile(fp,
-                            file_size,
-                            src_url,
+  dst_args = _PartitionFile(canned_acl,
                             dst_obj_metadata.contentType,
-                            canned_acl,
                             dst_bucket_url,
+                            file_size,
+                            fp,
                             random_prefix,
+                            src_url,
+                            dst_obj_metadata.storageClass,
                             tracker_file_name,
                             tracker_file_lock,
                             encryption_key_sha256=encryption_key_sha256,
@@ -1480,6 +1485,65 @@ def ExpandUrlToSingleBlr(url_str,
   # Case 4: If no objects/prefixes matched, and nonexistent objects should be
   # treated as subdirectories.
   return (storage_url, treat_nonexistent_object_as_subdir)
+
+
+def TriggerReauthForDestinationProviderIfNecessary(destination_url, gsutil_api,
+                                                   worker_count):
+  """Makes a request to the destination API provider to trigger reauth.
+
+  Addresses https://github.com/GoogleCloudPlatform/gsutil/issues/1639.
+
+  If an API call occurs in a child process, the library that handles
+  reauth will fail. We need to make at least one API call in the main
+  process to allow a user to reauthorize.
+
+  For cloud source URLs this already happens because the plurality of
+  the source name expansion iterator is checked in the main thread. For
+  cloud destination URLs, only some situations result in a similar API
+  call. In these situations, this function exits without performing an
+  API call. In others, this function performs an API call to trigger
+  reauth.
+
+  Args:
+    destination_url (StorageUrl): The destination of the transfer.
+    gsutil_api (CloudApiDelegator): API to use for the GetBucket call.
+    worker_count (int): If greater than 1, assume that parallel execution
+      is used. Technically, reauth challenges can be answered in the main
+      process, but they may be triggered multiple times if multithreading
+      is used.
+
+  Returns:
+    None, but performs an API call if necessary.
+  """
+  # Only perform this check if the user has opted in.
+  if not config.getbool(
+      'GSUtil', 'trigger_reauth_challenge_for_parallel_operations', False):
+    return
+
+  # Reauth is not necessary for non-cloud destinations.
+  if not destination_url.IsCloudUrl():
+    return
+
+  # Destination wildcards are expanded by an API call in the main process.
+  if ContainsWildcard(destination_url.url_string):
+    return
+
+  # If gsutil executes sequentially, all calls will occur in the main process.
+  if worker_count == 1:
+    return
+
+  try:
+    # The specific API call is not important, but one must occur.
+    gsutil_api.GetBucket(
+        destination_url.bucket_name,
+        fields=['location'],  # Single field to limit XML API calls.
+        provider=destination_url.scheme)
+  except Exception as e:
+    if isinstance(e, pyu2f.errors.PluginError):
+      raise
+
+    # Other exceptions can be ignored. The purpose was just to trigger
+    # a reauth challenge.
 
 
 def FixWindowsNaming(src_url, dst_url):
@@ -1970,8 +2034,8 @@ def _ApplyZippedUploadCompression(src_url, src_obj_filestream, src_obj_size,
           'gzip compression is not currently supported on streaming uploads. '
           'Remove the compression flag or save the streamed output '
           'temporarily to a file before uploading.')
-    if src_obj_size is not None and (CheckFreeSpace(gzip_path) <
-                                     2 * int(src_obj_size)):
+    if src_obj_size is not None and (CheckFreeSpace(gzip_path)
+                                     < 2 * int(src_obj_size)):
       raise CommandException('Inadequate temp space available to compress '
                              '%s. See the CHANGING TEMP DIRECTORIES section '
                              'of "gsutil help cp" for more info.' % src_url)
@@ -2147,9 +2211,9 @@ def _UploadFileToObject(src_url,
       src_obj_size,
       gsutil_api,
       canned_acl=global_copy_helper_opts.canned_acl)
-  non_resumable_upload = (
-      (0 if upload_size is None else upload_size) < ResumableThreshold() or
-      src_url.IsStream() or src_url.IsFifo())
+  non_resumable_upload = ((0 if upload_size is None else upload_size)
+                          < ResumableThreshold() or src_url.IsStream() or
+                          src_url.IsFifo())
 
   if ((src_url.IsStream() or src_url.IsFifo()) and
       gsutil_api.GetApiSelector(provider=dst_url.scheme) == ApiSelector.JSON):
